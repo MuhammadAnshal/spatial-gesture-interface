@@ -1,0 +1,809 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>AI Hand Tracking Prototype</title>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"
+        crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #111;
+            /* Dark background taake green glow acha lage */
+        }
+
+        video {
+            display: none;
+        }
+
+        /* Original video hide kar di, canvas pe draw karenge */
+        canvas {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+            transform: scaleX(-1);
+            /* Mirror effect taake movement natural lage */
+        }
+
+        #hud {
+            position: absolute;
+            top: 30px;
+            right: 30px;
+            text-align: right;
+            color: #00f0ff;
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 24px;
+            font-weight: bold;
+            text-shadow: 0 0 15px #00f0ff;
+            pointer-events: none;
+            display: none;
+            /* Show only when tracking */
+        }
+
+        #status-text {
+            font-size: 18px;
+            margin-top: 5px;
+            color: #ff9600;
+            text-shadow: 0 0 10px #ff9600;
+        }
+
+        @keyframes shake {
+            0% {
+                transform: translate(1px, 1px) rotate(0deg);
+            }
+
+            10% {
+                transform: translate(-5px, -2px) rotate(-1deg);
+            }
+
+            20% {
+                transform: translate(-3px, 0px) rotate(1deg);
+            }
+
+            30% {
+                transform: translate(3px, 2px) rotate(0deg);
+            }
+
+            40% {
+                transform: translate(1px, -1px) rotate(1deg);
+            }
+
+            50% {
+                transform: translate(-1px, 2px) rotate(-1deg);
+            }
+
+            60% {
+                transform: translate(-3px, 1px) rotate(0deg);
+            }
+
+            70% {
+                transform: translate(3px, 1px) rotate(-1deg);
+            }
+
+            80% {
+                transform: translate(-1px, -1px) rotate(1deg);
+            }
+
+            90% {
+                transform: translate(1px, 2px) rotate(0deg);
+            }
+
+            100% {
+                transform: translate(1px, -2px) rotate(-1deg);
+            }
+        }
+
+        .screen-shake {
+            animation: shake 0.2s;
+            animation-iteration-count: infinite;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div id="hud">
+        <div id="distance-text">DISTANCE: 0PX</div>
+        <div id="status-text">STATUS: HOLOGRAPHIC GLOBE</div>
+    </div>
+    <video class="input_video"></video>
+    <canvas class="output_canvas"></canvas>
+
+    <script>
+        const videoElement = document.querySelector('.input_video');
+        const canvasElement = document.querySelector('.output_canvas');
+        const canvasCtx = canvasElement.getContext('2d');
+
+        // --- THREE.JS SETUP ---
+        const scene = new THREE.Scene();
+        const threeCamera = new THREE.OrthographicCamera(window.innerWidth / -2, window.innerWidth / 2, window.innerHeight / 2, window.innerHeight / -2, 1, 5000);
+        threeCamera.position.z = 2000;
+
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+        scene.add(ambientLight);
+        const pointLight = new THREE.PointLight(0x00f0ff, 2, 1000);
+        pointLight.position.set(0, 0, 500); // Front light
+        scene.add(pointLight);
+
+        const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.domElement.style.position = 'absolute';
+        renderer.domElement.style.top = '0';
+        renderer.domElement.style.left = '0';
+        renderer.domElement.style.pointerEvents = 'none';
+        renderer.domElement.style.transform = 'scaleX(-1)';
+        renderer.domElement.style.transition = 'opacity 0.4s ease'; // Smooth fade for Three.js canvas
+        document.body.appendChild(renderer.domElement);
+
+        // Hologram / DBZ Sphere Design
+        const sphereGroup = new THREE.Group();
+
+        // Inner Core (Solid 3D Metallic/Energy Globe)
+        const coreGeom = new THREE.SphereGeometry(0.85, 32, 32);
+        const coreMat = new THREE.MeshStandardMaterial({
+            color: 0xffffff,
+            emissive: 0x0055ff,
+            roughness: 0.1,
+            metalness: 0.8
+        });
+        const coreSphere = new THREE.Mesh(coreGeom, coreMat);
+
+        // Outer Aura Ring
+        const auraGeom = new THREE.SphereGeometry(1.15, 32, 32);
+        const auraMat = new THREE.MeshBasicMaterial({
+            color: 0x39ff14,
+            transparent: true,
+            opacity: 0.5,
+            blending: THREE.AdditiveBlending
+        });
+        const auraSphere = new THREE.Mesh(auraGeom, auraMat);
+
+        // Grid for Holographic mode to enforce 3D globe structure
+        const gridGeom = new THREE.SphereGeometry(1.2, 16, 16);
+        const gridMat = new THREE.MeshBasicMaterial({ color: 0x00f0ff, wireframe: true, transparent: true, opacity: 0.4 });
+        const gridSphere = new THREE.Mesh(gridGeom, gridMat);
+
+        sphereGroup.add(coreSphere);
+        sphereGroup.add(gridSphere);
+        sphereGroup.add(auraSphere);
+        sphereGroup.visible = false;
+        scene.add(sphereGroup);
+
+        // --- WEB AUDIO API SFX SYNTHESIZER ---
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        const sfxCtx = new AudioContext();
+        let gatherOsc = null;
+        let gatherGain = null;
+        let isGatheringSoundPlaying = false;
+
+        function playGatherSFX() {
+            if (sfxCtx.state === 'suspended') sfxCtx.resume();
+            if (isGatheringSoundPlaying) return;
+            isGatheringSoundPlaying = true;
+
+            gatherOsc = sfxCtx.createOscillator();
+            gatherGain = sfxCtx.createGain();
+            gatherOsc.type = 'sawtooth'; // Smoother DBZ charge tone
+
+            gatherOsc.frequency.setValueAtTime(200, sfxCtx.currentTime);
+            gatherOsc.frequency.exponentialRampToValueAtTime(900, sfxCtx.currentTime + 3.0); // Rising pitch
+
+            // Clean attack
+            gatherGain.gain.setValueAtTime(0, sfxCtx.currentTime);
+            gatherGain.gain.linearRampToValueAtTime(0.2, sfxCtx.currentTime + 0.3);
+
+            gatherOsc.connect(gatherGain);
+            gatherGain.connect(sfxCtx.destination);
+            gatherOsc.start();
+        }
+
+        function playThrowSFX() {
+            if (sfxCtx.state === 'suspended') sfxCtx.resume();
+
+            const osc = sfxCtx.createOscillator();
+            const gain = sfxCtx.createGain();
+
+            osc.type = 'sine'; // Fast swoop away
+            osc.frequency.setValueAtTime(800, sfxCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(100, sfxCtx.currentTime + 0.3); // Zip away
+
+            gain.gain.setValueAtTime(0.8, sfxCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, sfxCtx.currentTime + 0.3);
+
+            osc.connect(gain);
+            gain.connect(sfxCtx.destination);
+
+            osc.start();
+            osc.stop(sfxCtx.currentTime + 0.3);
+        }
+
+        function stopGatherSFX() {
+            if (!isGatheringSoundPlaying || !gatherGain) return;
+
+            // Fix Audio Pop / Failure to recreate
+            gatherGain.gain.cancelScheduledValues(sfxCtx.currentTime);
+            gatherGain.gain.setValueAtTime(gatherGain.gain.value, sfxCtx.currentTime);
+            gatherGain.gain.linearRampToValueAtTime(0, sfxCtx.currentTime + 0.1);
+
+            let tempOsc = gatherOsc;
+            setTimeout(() => { if (tempOsc) { tempOsc.stop(); } }, 150);
+
+            gatherOsc = null;
+            isGatheringSoundPlaying = false;
+        }
+
+        function playBlastSFX() {
+            if (sfxCtx.state === 'suspended') sfxCtx.resume();
+            // Blast Deep Pulse
+            let osc = sfxCtx.createOscillator();
+            let gain = sfxCtx.createGain();
+            osc.type = 'sawtooth';
+            osc.frequency.setValueAtTime(200, sfxCtx.currentTime);
+            osc.frequency.exponentialRampToValueAtTime(20, sfxCtx.currentTime + 1.2);
+            gain.gain.setValueAtTime(0.5, sfxCtx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.01, sfxCtx.currentTime + 1.5);
+            osc.connect(gain);
+            gain.connect(sfxCtx.destination);
+            osc.start();
+            osc.stop(sfxCtx.currentTime + 2.0);
+
+            // Blast Explosion Noise + Long Rumble
+            let bufferSize = sfxCtx.sampleRate * 4; // Extend to 4 seconds
+            let buffer = sfxCtx.createBuffer(1, bufferSize, sfxCtx.sampleRate);
+            let data = buffer.getChannelData(0);
+            for (let i = 0; i < bufferSize; i++) {
+                data[i] = Math.random() * 2 - 1;
+            }
+            let noiseSrc = sfxCtx.createBufferSource();
+            noiseSrc.buffer = buffer;
+            let noiseFilter = sfxCtx.createBiquadFilter();
+            noiseFilter.type = 'lowpass';
+            noiseFilter.frequency.value = 1000;
+            let noiseGain = sfxCtx.createGain();
+            noiseGain.gain.setValueAtTime(1.0, sfxCtx.currentTime); // Louder start
+            noiseGain.gain.exponentialRampToValueAtTime(0.01, sfxCtx.currentTime + 3.8); // Much longer fade out
+
+            noiseSrc.connect(noiseFilter);
+            noiseFilter.connect(noiseGain);
+            noiseGain.connect(sfxCtx.destination);
+            noiseSrc.start();
+        }
+
+        // UI & Mode State
+        let currentMode = 'HOLOGRAPHIC_MODE';
+        // Modes: HOLOGRAPHIC_MODE, ELDRITCH_MODE, ULTIMATE_ATTACK_MODE
+        let stringOpacity = 0;
+
+        // Variables for Lerping
+        let targetX = 0;
+        let targetY = 0;
+        let targetScale = 1;
+
+        // Physics smoothing caches
+        let smoothedX = 0;
+        let smoothedY = 0;
+        let smoothedScale = 1;
+        let smoothedAvgPalmPx = 0; // Prevent jittery depth checks
+
+        let isGlobeVisible = false;
+
+        // --- DBZ SEQUENCE PHYSICS CACHES ---
+        let dbzState = 'IDLE'; // IDLE, GATHERING, LAUNCHING, EXPLODING
+        let dbzParticles = [];
+        let dbzExplosionParticles = [];
+        let dbzTimer = 0;
+        let lastAvgPalmPx = 0;
+
+        // Global color store
+        let hudR = 57, hudG = 255, hudB = 20;
+
+        const hudElement = document.getElementById('hud');
+        const distanceTextElem = document.getElementById('distance-text');
+        const statusTextElem = document.getElementById('status-text');
+
+        const colorNear = new THREE.Color(0x39ff14); // Neon Green
+        const colorFar = new THREE.Color(0xff073a); // Neon Red
+
+        // Utility Math
+        function getRawDist(l1, l2, w, h) {
+            const dx = (l1.x - l2.x) * w;
+            const dy = (l1.y - l2.y) * h;
+            return Math.sqrt(dx * dx + dy * dy);
+        }
+
+        // Expanded Gesture Detection
+        function detectGesture(landmarks, w, h) {
+            let extendedFingers = [];
+            const tips = [8, 12, 16, 20];
+            const wrist = landmarks[0];
+
+            for (let i = 0; i < 4; i++) {
+                const tip = landmarks[tips[i]];
+                const pip = landmarks[tips[i] - 2];
+
+                const distTip = getRawDist(tip, wrist, w, h);
+                const distPip = getRawDist(pip, wrist, w, h);
+
+                if (distTip > distPip) {
+                    extendedFingers.push(tips[i]);
+                }
+            }
+
+            if (extendedFingers.length === 0) return 'FIST';
+            if (extendedFingers.length >= 3) return 'OPEN_PALM';
+            if (extendedFingers.length === 1 && extendedFingers[0] === 8) return 'POINTING';
+            return 'UNKNOWN';
+        }
+
+        function animateThree() {
+            requestAnimationFrame(animateThree);
+
+            // Smoothly update opacity targets
+            const targetStringOpacity = (isGlobeVisible && currentMode === 'ELDRITCH_STRING') ? 1.0 : 0.0;
+            stringOpacity += (targetStringOpacity - stringOpacity) * 0.15;
+
+            renderer.domElement.style.opacity = (currentMode === 'HOLOGRAPHIC_MODE' || currentMode === 'ULTIMATE_ATTACK_MODE') ? '1' : '0';
+
+            if ((isGlobeVisible || currentMode === 'ULTIMATE_ATTACK_MODE') && dbzState !== 'EXPLODING') {
+                sphereGroup.visible = true;
+                const minLerpFactor = (dbzState === 'LAUNCHING') ? 0.4 : 0.08; // Snap aggressively during Attack
+
+                // Advanced Lerping (Super Smooth)
+                smoothedX += (targetX - smoothedX) * minLerpFactor;
+                smoothedY += (targetY - smoothedY) * minLerpFactor;
+                smoothedScale += (targetScale - smoothedScale) * minLerpFactor;
+
+                sphereGroup.position.x = smoothedX;
+                sphereGroup.position.y = smoothedY;
+                sphereGroup.scale.set(smoothedScale, smoothedScale, 100); // Fixed massive Z-Axis clipping bug!
+
+                // Dynamic Color Interpolation
+                const currentDistance = smoothedScale * 2; // Diameter is the distance
+                const colorAlpha = Math.min(currentDistance / 400, 1.0);
+
+                // Smooth visual Lerping to prevent ALL aggressive visual pops between mode transitions
+                coreMat.transparent = true;
+                gridSphere.visible = true;
+
+                const targetCoreOpacity = (currentMode === 'ULTIMATE_ATTACK_MODE') ? 1.0 : 0.15;
+                const targetGridOpacity = (currentMode === 'ULTIMATE_ATTACK_MODE') ? 0.0 : 0.4;
+                const targetAuraOpacity = (currentMode === 'ULTIMATE_ATTACK_MODE') ? 0.8 : 0.3;
+
+                coreMat.opacity += (targetCoreOpacity - coreMat.opacity) * 0.1;
+                gridMat.opacity += (targetGridOpacity - gridMat.opacity) * 0.1;
+                auraMat.opacity += (targetAuraOpacity - auraMat.opacity) * 0.1;
+
+                const targetColor = new THREE.Color();
+                if (currentMode === 'ULTIMATE_ATTACK_MODE') {
+                    // DBZ Colors jittering intense energies
+                    targetColor.setHex(Math.random() > 0.5 ? 0xffffff : 0x00aaff);
+                } else {
+                    targetColor.lerpColors(colorNear, colorFar, colorAlpha);
+                }
+
+                auraMat.color.lerp(targetColor, 0.15);
+                coreMat.emissive.lerp(targetColor, 0.15);
+                gridMat.color.copy(auraMat.color);
+
+                // Update HUD Text
+                hudElement.style.display = 'block';
+                distanceTextElem.innerText = `DISTANCE: ${Math.round(currentDistance)}PX`;
+
+                const r = Math.round(auraMat.color.r * 255);
+                const g = Math.round(auraMat.color.g * 255);
+                const b = Math.round(auraMat.color.b * 255);
+
+                hudR = r; hudG = g; hudB = b;
+
+                distanceTextElem.style.color = `rgb(${r},${g},${b})`;
+                distanceTextElem.style.textShadow = `0 0 15px rgb(${r},${g},${b})`;
+
+                // Generic Jarvis styling logic for all Multi-Modes
+                function getModeColor(mode) {
+                    switch (mode) {
+                        case 'HOLOGRAPHIC_MODE': return '#00f0ff';
+                        case 'ELDRITCH_MODE': return '#ff9600';
+                        case 'ULTIMATE_ATTACK_MODE': return '#0088ff';
+                        default: return '#00f0ff';
+                    }
+                }
+                const activeColor = getModeColor(currentMode);
+                statusTextElem.innerText = "ACTIVE STATE: " + currentMode.replace(/_/g, ' ');
+                statusTextElem.style.color = activeColor;
+                statusTextElem.style.textShadow = `0 0 10px ${activeColor}`;
+
+                // DBZ scale manipulation natively injected into 3D
+                let rotSpeed = currentMode === 'ULTIMATE_ATTACK_MODE' ? 0.3 : 0.05;
+                sphereGroup.rotation.x += rotSpeed;
+                sphereGroup.rotation.y += rotSpeed;
+                coreSphere.rotation.z -= rotSpeed * 3.0; // Aggressive counter spin
+
+                // Holographic Flicker Effect
+                if (currentMode === 'HOLOGRAPHIC_MODE') {
+                    auraMat.transparent = true;
+                }
+
+            } else {
+                sphereGroup.visible = false;
+                hudElement.style.display = 'none';
+            }
+
+            renderer.render(scene, threeCamera);
+        }
+        animateThree();
+        // --- END THREE.JS SETUP ---
+
+        // Screen size ke hisaab se canvas set kar rahe hain
+        function resizeCanvas() {
+            canvasElement.width = window.innerWidth;
+            canvasElement.height = window.innerHeight;
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            threeCamera.left = window.innerWidth / -2;
+            threeCamera.right = window.innerWidth / 2;
+            threeCamera.top = window.innerHeight / 2;
+            threeCamera.bottom = window.innerHeight / -2;
+            threeCamera.updateProjectionMatrix();
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+
+        // Ye function har frame par chalega jab camera feed aayegi
+        function onResults(results) {
+            canvasCtx.save();
+            // Canvas clear karo aur current camera frame draw karo
+            canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+            canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+
+            // Global drawing variables for physics decoupling
+            let bothHandsDetected = (results.multiHandLandmarks && results.multiHandLandmarks.length === 2);
+            let anyHandDetected = (results.multiHandLandmarks && results.multiHandLandmarks.length > 0);
+
+            isGlobeVisible = false;
+
+            // Clear screen shake if inactive
+            document.body.classList.remove('screen-shake');
+
+            if (anyHandDetected) {
+                // Collect states
+                let states = results.multiHandLandmarks.map(h => detectGesture(h, canvasElement.width, canvasElement.height));
+
+                // Global depth tracker decoupled from state to prevent locking
+                let avgPalmPx = 0;
+                let palmVelocity = 0;
+                if (bothHandsDetected) {
+                    let palm1 = getRawDist(results.multiHandLandmarks[0][0], results.multiHandLandmarks[0][9], canvasElement.width, canvasElement.height);
+                    let palm2 = getRawDist(results.multiHandLandmarks[1][0], results.multiHandLandmarks[1][9], canvasElement.width, canvasElement.height);
+                    avgPalmPx = (palm1 + palm2) / 2;
+                    palmVelocity = avgPalmPx - lastAvgPalmPx;
+                    lastAvgPalmPx = avgPalmPx;
+                    smoothedAvgPalmPx += (avgPalmPx - smoothedAvgPalmPx) * 0.1;
+                } else {
+                    smoothedAvgPalmPx += (0 - smoothedAvgPalmPx) * 0.1;
+                    lastAvgPalmPx = smoothedAvgPalmPx;
+                }
+
+                // Force priorities for animation loops
+                if (dbzState === 'LAUNCHING' || dbzState === 'EXPLODING') {
+                    currentMode = 'ULTIMATE_ATTACK_MODE';
+                } else if (bothHandsDetected) {
+                    if (states[0] === 'FIST' && states[1] === 'FIST') {
+                        currentMode = 'ELDRITCH_MODE';
+                        dbzState = 'IDLE';
+                        stopGatherSFX();
+                    } else {
+                        let isStrictOpen = states[0] === 'OPEN_PALM' && states[1] === 'OPEN_PALM';
+                        let isAlreadyCharging = dbzState === 'GATHERING';
+
+                        if (isStrictOpen || isAlreadyCharging) {
+                            // DBZ Sequence Tracker Thresholds
+                            let GATHER_START = 55;
+                            let GATHER_DROP = 25;
+                            let LAUNCH_VELOCITY_THRESH = 7; // Forward Velocity / Jhatka 
+
+                            // Bypass Gather lag on Instant Rapid Thrust using velocity!
+                            if (dbzState === 'IDLE' && palmVelocity > LAUNCH_VELOCITY_THRESH && smoothedAvgPalmPx > GATHER_START) {
+                                dbzState = 'LAUNCHING';
+                                dbzTimer = 0;
+                                playThrowSFX();
+                            } else if (dbzState === 'IDLE' && smoothedAvgPalmPx > GATHER_START) {
+                                dbzState = 'GATHERING';
+                                playGatherSFX();
+                            }
+
+                            if (dbzState === 'GATHERING') {
+                                if (palmVelocity > LAUNCH_VELOCITY_THRESH) { // Detect rapid forward throw (Velocity logic)
+                                    currentMode = 'ULTIMATE_ATTACK_MODE';
+                                    dbzState = 'LAUNCHING';
+                                    dbzTimer = 0;
+                                    stopGatherSFX();
+                                    playThrowSFX();
+                                } else if (smoothedAvgPalmPx < GATHER_DROP) {
+                                    dbzState = 'IDLE';
+                                    currentMode = 'HOLOGRAPHIC_MODE';
+                                    stopGatherSFX();
+                                } else {
+                                    currentMode = 'ULTIMATE_ATTACK_MODE';
+                                }
+                            } else {
+                                if (dbzState !== 'LAUNCHING' && dbzState !== 'EXPLODING') {
+                                    currentMode = 'HOLOGRAPHIC_MODE';
+                                }
+                            }
+                        } else {
+                            currentMode = 'HOLOGRAPHIC_MODE';
+                            dbzState = 'IDLE';
+                            stopGatherSFX();
+                        }
+                    }
+                } else {
+                    if (states[0] === 'OPEN_PALM') currentMode = 'HOLOGRAPHIC_MODE';
+                    else currentMode = 'IDLE';
+                    dbzState = 'IDLE';
+                    stopGatherSFX();
+                }
+
+                // --- VISUAL RENDER PIPELINE based on currentMode ---
+
+                // Calculate targets dynamically, allowing persistence if hands drop during attack!
+                let cx = canvasElement.width / 2;
+                let cy = canvasElement.height / 2;
+                let handDist = 200;
+
+                if (bothHandsDetected && dbzState !== 'LAUNCHING' && dbzState !== 'EXPLODING') {
+                    const p1 = { x: results.multiHandLandmarks[0][8].x * canvasElement.width, y: results.multiHandLandmarks[0][8].y * canvasElement.height };
+                    const p2 = { x: results.multiHandLandmarks[1][8].x * canvasElement.width, y: results.multiHandLandmarks[1][8].y * canvasElement.height };
+                    cx = (p1.x + p2.x) / 2;
+                    cy = (p1.y + p2.y) / 2;
+                    handDist = Math.sqrt((p2.x - p1.x) ** 2 + (p2.y - p1.y) ** 2);
+                } else if (currentMode === 'ULTIMATE_ATTACK_MODE') {
+                    // Lock coordinates to exact trajectory of physical throw
+                    cx = smoothedX + canvasElement.width / 2;
+                    cy = -smoothedY + canvasElement.height / 2;
+                    handDist = targetScale * 2; // Capture locked scale dynamically
+                }
+
+                if (currentMode === 'HOLOGRAPHIC_MODE' || currentMode === 'ULTIMATE_ATTACK_MODE') {
+                    if (currentMode === 'HOLOGRAPHIC_MODE') {
+                        isGlobeVisible = bothHandsDetected;
+                    } else if (currentMode === 'ULTIMATE_ATTACK_MODE') {
+                        isGlobeVisible = (dbzState === 'GATHERING' || dbzState === 'LAUNCHING');
+                    }
+
+                    let distance = handDist;
+
+                    if (currentMode === 'ULTIMATE_ATTACK_MODE') {
+                        if (dbzState === 'GATHERING') {
+                            // Physically locks to hands size, but jitters aggressively based on power
+                            distance = handDist * (1.0 + (Math.random() * 0.1 - 0.05));
+                        }
+                        else if (dbzState === 'LAUNCHING') {
+                            // Sphere scales down massively simulating a physical projectile detaching and thrown AWAY
+                            distance = Math.max(30, handDist - (dbzTimer * 50));
+                        }
+                    }
+
+                    targetX = cx - canvasElement.width / 2;
+                    targetY = -(cy - canvasElement.height / 2);
+                    targetScale = distance / 2;
+
+                    // Prevent snap logic, let the smoothness variables glide elegantly
+                    if (!sphereGroup.visible && isGlobeVisible) {
+                        sphereGroup.position.set(targetX, targetY, sphereGroup.position.z);
+                        smoothedX = targetX; smoothedY = targetY; smoothedScale = targetScale;
+                    }
+                }
+
+                if (currentMode === 'ELDRITCH_MODE' && stringOpacity > 0.01 && bothHandsDetected) {
+                    const hand1 = results.multiHandLandmarks[0];
+                    const hand2 = results.multiHandLandmarks[1];
+                    canvasCtx.globalAlpha = stringOpacity;
+                    const fingerTips = [4, 8, 12, 16, 20];
+                    for (let tipIdx of fingerTips) {
+                        const tip1 = { x: hand1[tipIdx].x * canvasElement.width, y: hand1[tipIdx].y * canvasElement.height };
+                        const tip2 = { x: hand2[tipIdx].x * canvasElement.width, y: hand2[tipIdx].y * canvasElement.height };
+
+                        canvasCtx.beginPath();
+                        canvasCtx.moveTo(tip1.x, tip1.y);
+
+                        const segments = 5;
+                        for (let i = 1; i <= segments; i++) {
+                            let t = i / segments;
+                            if (i === segments) {
+                                canvasCtx.lineTo(tip2.x, tip2.y);
+                            } else {
+                                canvasCtx.lineTo(tip1.x + (tip2.x - tip1.x) * t + (Math.random() - 0.5) * 30, tip1.y + (tip2.y - tip1.y) * t + (Math.random() - 0.5) * 30);
+                            }
+                        }
+
+                        canvasCtx.lineWidth = 4;
+                        canvasCtx.strokeStyle = 'rgb(255, 180, 50)';
+                        canvasCtx.shadowColor = 'rgb(255, 100, 0)';
+                        canvasCtx.shadowBlur = 15;
+                        canvasCtx.stroke();
+
+                        canvasCtx.lineWidth = 2;
+                        canvasCtx.strokeStyle = '#ffffff';
+                        canvasCtx.stroke();
+                    }
+                    canvasCtx.globalAlpha = 1.0;
+                }
+
+                // === DBZ SEQUENCE RENDERING PIPELINE ===
+                if (currentMode === 'ULTIMATE_ATTACK_MODE') {
+                    let cx = canvasElement.width / 2;
+                    let cy = canvasElement.height / 2;
+
+                    // Match visual coordinates exactly to the locked throwing frame
+                    if (bothHandsDetected && dbzState !== 'LAUNCHING' && dbzState !== 'EXPLODING') {
+                        const h1 = results.multiHandLandmarks[0][9];
+                        const h2 = results.multiHandLandmarks[1][9];
+                        cx = ((h1.x + h2.x) / 2) * canvasElement.width;
+                        cy = ((h1.y + h2.y) / 2) * canvasElement.height;
+                    } else {
+                        cx = smoothedX + canvasElement.width / 2;
+                        cy = -smoothedY + canvasElement.height / 2;
+                    }
+
+                    if (dbzState === 'GATHERING') {
+                        // Draw Swirling Particles
+                        if (Math.random() > 0.1) {
+                            for (let r = 0; r < 3; r++) { // Faster gather
+                                dbzParticles.push({
+                                    x: cx + (Math.random() - 0.5) * 800,
+                                    y: cy + (Math.random() - 0.5) * 800,
+                                    angle: Math.random() * Math.PI * 2,
+                                    radius: 400 + Math.random() * 200,
+                                    speed: Math.random() * 0.1 + 0.05,
+                                    color: 'rgba(255, 255, 255, 0.8)'
+                                });
+                            }
+                        }
+
+                        // Chaotic 2D Lightning branches striking outward from DBZ Globe
+                        for (let j = 0; j < 4; j++) {
+                            canvasCtx.beginPath();
+                            canvasCtx.moveTo(cx, cy);
+                            let lx = cx; let ly = cy;
+                            for (let step = 0; step < 5; step++) {
+                                lx += (Math.random() - 0.5) * 200;
+                                ly += (Math.random() - 0.5) * 200;
+                                canvasCtx.lineTo(lx, ly);
+                            }
+                            canvasCtx.lineWidth = 1.5 + Math.random() * 2.5;
+                            canvasCtx.strokeStyle = '#ffffff';
+                            canvasCtx.shadowColor = '#00aaff';
+                            canvasCtx.shadowBlur = 10;
+                            canvasCtx.stroke();
+                        }
+
+                        canvasCtx.save();
+                        for (let i = dbzParticles.length - 1; i >= 0; i--) {
+                            let p = dbzParticles[i];
+                            p.radius -= 15; // Suck into center
+                            p.angle += p.speed;
+                            if (p.radius <= 20) {
+                                dbzParticles.splice(i, 1);
+                                continue;
+                            }
+                            let px = cx + Math.cos(p.angle) * p.radius;
+                            let py = cy + Math.sin(p.angle) * p.radius;
+
+                            canvasCtx.beginPath();
+                            canvasCtx.arc(px, py, 4, 0, Math.PI * 2);
+                            canvasCtx.fillStyle = Math.random() > 0.5 ? '#00f0ff' : '#ffffff';
+                            canvasCtx.shadowColor = '#00f0ff'; canvasCtx.shadowBlur = 10;
+                            canvasCtx.fill();
+                        }
+                        canvasCtx.restore();
+                    }
+
+                    else if (dbzState === 'LAUNCHING') {
+                        dbzTimer++;
+
+                        if (dbzTimer > 8) { // Travel time before massive explosion phase hits the screen
+                            dbzState = 'EXPLODING';
+                            dbzTimer = 0;
+                            playBlastSFX(); // Explosion triggers upon hitting the invisible wall
+                            // Initialize 100 explosion particles
+                            for (let i = 0; i < 100; i++) {
+                                dbzExplosionParticles.push({
+                                    x: cx, y: cy,
+                                    vx: (Math.random() - 0.5) * 60,
+                                    vy: (Math.random() - 0.5) * 60,
+                                    color: ['#00f0ff', '#ffffff', '#00eaff'][Math.floor(Math.random() * 3)],
+                                    life: 1.0
+                                });
+                            }
+                        }
+                    }
+
+                    else if (dbzState === 'EXPLODING') {
+                        dbzTimer++;
+
+                        if (dbzTimer < 15) {
+                            document.body.classList.add('screen-shake');
+                        } else {
+                            // Eliminate vibration early for crispness
+                            document.body.classList.remove('screen-shake');
+                        }
+
+                        // Blinding Flash Mask (Fades over time)
+                        let flashAlpha = Math.max(0, 1.0 - (dbzTimer * 0.05));
+                        if (flashAlpha > 0) {
+                            canvasCtx.fillStyle = `rgba(255, 255, 255, ${flashAlpha})`;
+                            canvasCtx.fillRect(0, 0, canvasElement.width, canvasElement.height);
+                        }
+
+                        // Explosion Particles
+                        canvasCtx.globalCompositeOperation = 'lighter';
+                        for (let i = dbzExplosionParticles.length - 1; i >= 0; i--) {
+                            let p = dbzExplosionParticles[i];
+                            p.x += p.vx; p.y += p.vy;
+                            p.life -= 0.02;
+                            if (p.life <= 0) {
+                                dbzExplosionParticles.splice(i, 1);
+                                continue;
+                            }
+                            canvasCtx.beginPath();
+                            canvasCtx.arc(p.x, p.y, p.life * 25, 0, Math.PI * 2);
+                            canvasCtx.fillStyle = p.color;
+                            canvasCtx.fill();
+                        }
+                        canvasCtx.globalCompositeOperation = 'source-over';
+
+                        if (dbzTimer > 40) {
+                            dbzState = 'IDLE'; // Clean automatic instantaneous reset! No holding required!
+                            currentMode = 'HOLOGRAPHIC_MODE';
+                            document.body.classList.remove('screen-shake');
+                        }
+                    }
+                }
+
+            } else {
+                // No hands detected
+                isGlobeVisible = false;
+            }
+
+            // Hathon par reference dots draw karne ke liye
+            if (results.multiHandLandmarks) {
+                for (const landmarks of results.multiHandLandmarks) {
+                    drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, { color: 'rgba(0, 255, 0, 0.5)', lineWidth: 1 });
+                    drawLandmarks(canvasCtx, landmarks, { color: '#ffffff', lineWidth: 1, radius: 2 });
+                }
+            }
+            canvasCtx.restore();
+        }
+
+        // MediaPipe Hands setup
+        const hands = new Hands({
+            locateFile: (file) => {
+                return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+            }
+        });
+
+        hands.setOptions({
+            maxNumHands: 2, // Maximum 2 hath track karega
+            modelComplexity: 1,
+            minDetectionConfidence: 0.5,
+            minTrackingConfidence: 0.5
+        });
+        hands.onResults(onResults);
+
+        // Camera start karna
+        const camera = new Camera(videoElement, {
+            onFrame: async () => {
+                await hands.send({ image: videoElement });
+            },
+            width: 1280,
+            height: 720
+        });
+        camera.start();
+    </script>
+</body>
+
+</html>
