@@ -2,6 +2,8 @@
 
 A high-performance web-based interface that combines **Computer Vision** and **3D Rendering** to allow touchless interaction.
 
+![Project Demo](demo.gif)
+
 ### Key Features:
 - **Hand Tracking:** Uses Google MediaPipe for 21-point landmark detection.
 - **3D Graphics:** Integrated with Three.js for real-time spatial rendering.
